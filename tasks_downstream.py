@@ -24,6 +24,9 @@ try:
 except ImportError:
     from invoke.util import yaml
 
+import requests
+from colorama import Fore, Style, init
+
 PROJECT_ROOT = Path(__file__).parent.absolute()
 SRC_PATH = PROJECT_ROOT / "odoo" / "custom" / "src"
 UID_ENV = {
@@ -1095,3 +1098,158 @@ def restore_snapshot(
         )
         if "Stopping" in cur_state:
             c.run(f"{DOCKER_COMPOSE_CMD} start odoo db", pty=True)
+
+
+@task(
+    help={
+        "versions": "Number of versions to check for migration. Default: 1",
+        "repository": "Check only this repository. Default: all",
+    },
+)
+def possible_migration(c, repository=None, versions=1):
+    """Check if modules in addons.yaml can be migrated to a newer Odoo version."""
+    # pylint: disable=W8116
+    init()
+
+    addons_file = Path(PROJECT_ROOT, "odoo", "custom", "src", "addons.yaml")
+    if not addons_file.exists():
+        _logger.error(f"File {addons_file} not found")
+        return 1
+
+    try:
+        versions = int(versions)
+    except ValueError:
+        _logger.error("versions parameter must be an integer")
+        return 1
+
+    odoo_version = ODOO_VERSION + versions
+    print(f"Checking for Odoo: {odoo_version}")
+
+    terminal_width = min(shutil.get_terminal_size().columns, 75)
+    print(f"{Fore.WHITE}{Style.BRIGHT}╔{'═' * (terminal_width - 2)}╗")
+    print(f"║{' MIGRATION ANALYSIS REPORT ':^{terminal_width - 2}}║")
+    print(f"╚{'═' * (terminal_width - 2)}╝{Style.RESET_ALL}")
+
+    module_col_width = terminal_width - 25
+
+    print(f"┌─{'─' * module_col_width}─┬────────────────┐")
+    print(
+        f"{Style.BRIGHT}│ "
+        f"{'Module':<{module_col_width}} │ "
+        f"Status         │{Style.RESET_ALL}"
+    )
+    print(f"├─{'─' * module_col_width}─┼────────────────┤")
+
+    total_modules = 0
+    migratable_modules = 0
+
+    url = (
+        "https://raw.githubusercontent.com/OCA/OpenUpgrade/refs/heads/"
+        f"{odoo_version}/openupgrade_scripts/apriori.py"
+    )
+    response = requests.get(url, timeout=10)
+    response.raise_for_status()
+    namespace = {}
+    exec(response.text, namespace)
+
+    try:
+        addons_content = yaml.safe_load(addons_file.read_text())
+        show_only_repo = repository or "all"
+        for repository, modules in addons_content.items():
+            if repository != show_only_repo and show_only_repo != "all":
+                continue
+            if repository == "OpenUpgrade":
+                continue
+            print(f"├─{'─' * module_col_width}─┼────────────────┤")
+            print(
+                f"{Fore.YELLOW}{Style.BRIGHT}│ "
+                f"{'REPOSITORY: ' + repository:<{module_col_width}} │"
+                f"                │{Style.RESET_ALL}"
+            )
+            print(f"├─{'─' * module_col_width}─┼────────────────┤")
+
+            for module in modules:
+                total_modules += 1
+
+                if namespace.get("merged_modules", {}).get(module):
+                    print(
+                        f"{Fore.GREEN}│ "
+                        f"{module:<{module_col_width}} │ "
+                        f"✅ Renamed     │{Style.RESET_ALL}"
+                    )
+                    migratable_modules += 1
+                    continue
+
+                # Check if module exists in OCA repository
+                url = (
+                    f"https://github.com/OCA/{repository}/tree/{odoo_version}/{module}"
+                )
+                try:
+                    response = requests.head(url, allow_redirects=True, timeout=10)
+                    status_code = response.status_code
+                    if status_code == 200:
+                        print(
+                            f"{Fore.GREEN}│ "
+                            f"{module:<{module_col_width}} │ "
+                            f"✅ Available   │{Style.RESET_ALL}"
+                        )
+                        migratable_modules += 1
+                    else:
+                        _logger.error(
+                            f"{Fore.RED}│ "
+                            f"{module:<{module_col_width}} │ "
+                            f"❌ Not found   │{Style.RESET_ALL}"
+                        )
+                except requests.Timeout:
+                    _logger.warn(
+                        f"{Fore.YELLOW}│ "
+                        f"{module:<{module_col_width}} │ "
+                        f"⚠️ Timeout      │{Style.RESET_ALL}"
+                    )
+                except Exception:
+                    _logger.error(
+                        f"{Fore.RED}│ "
+                        f"{module:<{module_col_width}} │ "
+                        f"❌ Error       │{Style.RESET_ALL}"
+                    )
+
+    except Exception as e:
+        _logger.error(f"Error processing addons.yaml: {e}")
+        return 1
+
+    print(f"└─{'─' * module_col_width}─┴────────────────┘")
+
+    print("")
+    print(f"{Fore.WHITE}{Style.BRIGHT}╔{'═' * (terminal_width - 2)}╗")
+    print(f"║{' MIGRATION SUMMARY ':^{terminal_width - 2}}║")
+    print(f"╚{'═' * (terminal_width - 2)}╝{Style.RESET_ALL}")
+
+    percentage = 0
+    if total_modules > 0:
+        percentage = round((migratable_modules * 100) / total_modules, 2)
+
+    bar_width = 50
+    filled_width = int(percentage * bar_width / 100)
+    empty_width = bar_width - filled_width
+
+    print(f"┌─{'─' * (bar_width + 2)}─┐")
+
+    progress_bar = "│ ["
+    if percentage >= 80:
+        progress_bar += f"{Fore.GREEN}{'█' * filled_width}"
+    elif percentage >= 50:
+        progress_bar += f"{Fore.YELLOW}{'█' * filled_width}"
+    else:
+        progress_bar += f"{Fore.RED}{'█' * filled_width}"
+
+    progress_bar += f"{Style.RESET_ALL}{'░' * empty_width}] │"
+    print(progress_bar)
+
+    print(f"└─{'─' * (bar_width + 2)}─┘")
+
+    print("")
+    print(f"• Total modules: {total_modules}")
+    print(f"• Migratable modules: {migratable_modules}")
+    print(f"• Migration readiness: {percentage}%")
+    print("")
+    return 0
